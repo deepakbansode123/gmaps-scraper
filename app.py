@@ -42,6 +42,17 @@ subprocess.run(
     check=False,
 )
 
+# Ensure openpyxl is available (Streamlit Cloud sometimes fails to install
+# from requirements.txt due to caching). This is a no-op if already present.
+try:
+    import openpyxl  # noqa: F401
+except ImportError:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "openpyxl>=3.1"],
+        capture_output=True,
+        check=False,
+    )
+
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -62,22 +73,209 @@ SEL = {
     # Feed / cards
     "feed":          'div[role="feed"]',
     "card_link":     'a.hfpxzc',                          # listing card anchor
-    "card_name":     'div.qBF1Pd, .fontHeadlineSmall',
-    "card_rating":   'span.MW4etd',
-    "card_reviews":  'span.UY7F9',
-    "card_category": 'span.YhemCb',
-    "card_address":  'button[data-item-id="address"] .rFm3Rc, .W4Efnf',
     # Detail page
     "name":          'h1.DUwDvf',
-    "rating":        'div.F7nice span[aria-hidden="true"]',
-    "reviews":       'div.F7nice button[aria-label]',
-    "category":      'button[jsaction*="category"] span, button[jsaction*="pane.rating.category"]',
-    "address":       'button[data-item-id="address"] div.Io6YIf, [data-item-id="address"] .Io6YIf',
-    "phone":         'button[data-item-id^="phone:"] div.Io6YIf, [data-item-id^="phone:"] .Io6YIf',
-    "website":       'a[data-item-id="authority"]',
-    "plus_code":     'button[data-item-id="oloc"] div.Io6YIf, [data-item-id="oloc"] .Io6YIf',
-    "hours":         'div.t39EBfGU tbody tr:first-child td:last-child, div.t39EBfGU span',
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JavaScript extraction snippets — single-eval, multiple fallbacks per field.
+# This is dramatically more reliable than querying CSS selectors one-by-one
+# because Google rotates class names frequently.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Feed-card extraction: walks each `<a class="hfpxzc">` and pulls data from
+# its parent container using multiple strategies.
+JS_EXTRACT_FEED_CARDS = r"""
+() => {
+  const cards = document.querySelectorAll('a.hfpxzc');
+  const out = [];
+  cards.forEach(card => {
+    try {
+      const href = card.getAttribute('href') || '';
+      let name = (card.getAttribute('aria-label') || '').trim();
+      // climb up to the article-like container
+      let container = card.closest('div[role="article"]')
+                  || card.parentElement?.parentElement?.parentElement
+                  || card.parentElement;
+      if (!container) container = card;
+
+      if (!name) {
+        const n = container.querySelector('.qBF1Pd, .fontHeadlineSmall, [role="button"] .fontHeadlineSmall');
+        if (n) name = n.innerText.trim();
+      }
+
+      // rating
+      let rating = '';
+      const rEl = container.querySelector('.MW4etd, span[role="img"][aria-label$="star"]');
+      if (rEl) rating = (rEl.innerText || rEl.getAttribute('aria-label') || '').trim();
+
+      // reviews
+      let reviews = '';
+      const rvEl = container.querySelector('.UY7F9, span.UY7F9');
+      if (rvEl) reviews = (rvEl.innerText || '').replace(/[()]/g, '').trim();
+
+      // category — usually the span AFTER the rating block, looks like "· Restaurant"
+      let category = '';
+      const catEl = container.querySelector('.YhemCb');
+      if (catEl) category = catEl.innerText.trim();
+      if (!category) {
+        // fallback: spans that are NOT the rating/reviews spans
+        const spans = Array.from(container.querySelectorAll('span'));
+        const candidate = spans.find(s => {
+          const t = (s.innerText || '').trim();
+          return t && t !== rating && t !== reviews && t !== name
+              && !t.startsWith('(') && !/^\d+(\.\d+)?$/.test(t) && t.length > 2 && t.length < 60;
+        });
+        if (candidate) category = candidate.innerText.trim();
+      }
+
+      // address — Google's feed cards put it in .W4Efnf container, often
+      // prefixed with "·". Try that first, then fall back to span detection.
+      let address = '';
+      // Strategy 1: .W4Efnf div is Google's address container
+      const addrDiv = container.querySelector('.W4Efnf, div.W4Efnf span');
+      if (addrDiv) {
+        const t = (addrDiv.innerText || '').trim();
+        if (t) address = t.replace(/^·\s*/, '').trim();
+      }
+      // Strategy 2: look for a span starting with "·" (separator)
+      if (!address) {
+        const spans2 = Array.from(container.querySelectorAll('span'));
+        for (const s of spans2) {
+          const t = (s.innerText || '').trim();
+          if (t.startsWith('·') && t.length > 5) {
+            address = t.replace(/^·\s*/, '').trim();
+            break;
+          }
+        }
+      }
+      // Strategy 3: span containing address keywords, NOT a rating/review span
+      if (!address) {
+        const spans3 = Array.from(container.querySelectorAll('span'));
+        for (const s of spans3) {
+          const t = (s.innerText || '').trim();
+          if (!t || t === name || t === rating || t === reviews || t === category) continue;
+          if (t.startsWith('·')) { address = t.replace(/^·\s*/, '').trim(); break; }
+          // Skip pure-number ratings or "(...)" reviews
+          if (/^\d+(\.\d+)?$/.test(t) || /^\([\d,]+\)$/.test(t)) continue;
+          if (/(road|street|st\b|avenue|ave|marg|nagar|colony|sector|phase|near|opposite|puram|district|state|india)/i.test(t)
+              && t.length > 8 && t.length < 200) {
+            address = t;
+            break;
+          }
+        }
+      }
+
+      // coords from href
+      let lat = '', lng = '';
+      const m = href.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+      if (m) { lat = m[1]; lng = m[2]; }
+
+      out.push({ name, rating, reviews, category, address, phone: '', website: '',
+                 plus_code: '', latitude: lat, longitude: lng, hours_today: '',
+                 maps_url: href });
+    } catch (e) {}
+  });
+  return out;
+}
+"""
+
+# Detail-page extraction: one big JS function that pulls every field at once
+# using multiple strategies. Returns null on catastrophic failure.
+JS_EXTRACT_DETAIL = r"""
+() => {
+  const result = {
+    name: '', rating: '', reviews: '', category: '', address: '',
+    phone: '', website: '', plus_code: '', hours_today: '', latitude: '', longitude: ''
+  };
+
+  // NAME — h1.DUwDvf is the canonical place
+  const nameEl = document.querySelector('h1.DUwDvf') || document.querySelector('h1');
+  if (nameEl) result.name = nameEl.innerText.trim();
+
+  // RATING + REVIEWS — the F7nice cluster
+  const ratingCluster = document.querySelector('div.F7nice, div[role="img"][aria-label*="star"]');
+  if (ratingCluster) {
+    const ariaLabel = ratingCluster.getAttribute('aria-label') || '';
+    // aria-label usually: "4.5 stars, 1,234 reviews"
+    const rMatch = ariaLabel.match(/([\d.]+)\s*stars?/i);
+    if (rMatch) result.rating = rMatch[1];
+    const revMatch = ariaLabel.match(/([\d,]+)\s*reviews?/i);
+    if (revMatch) result.reviews = revMatch[1].replace(/,/g, '');
+    // fallback: hidden spans
+    if (!result.rating) {
+      const rs = ratingCluster.querySelector('span[aria-hidden="true"], span.MW4etd');
+      if (rs) result.rating = (rs.innerText || '').trim();
+    }
+    if (!result.reviews) {
+      const rvs = ratingCluster.querySelector('span[aria-label], button[aria-label]');
+      if (rvs) {
+        const al = rvs.getAttribute('aria-label') || rvs.innerText || '';
+        const m = al.match(/([\d,]+)\s*reviews?/i);
+        if (m) result.reviews = m[1].replace(/,/g, '');
+        else result.reviews = al.replace(/[()]/g, '').replace(/reviews?/i, '').trim();
+      }
+    }
+  }
+
+  // CATEGORY — button containing "category" jsaction, or .YhemCb
+  const catBtn = document.querySelector('button[jsaction*="category"], button[jsaction*="pane.rating.category"]');
+  if (catBtn) result.category = catBtn.innerText.trim();
+  if (!result.category) {
+    const catSpan = document.querySelector('.YhemCb, button.mmzxSc span');
+    if (catSpan) result.category = catSpan.innerText.trim();
+  }
+
+  // ACTION BUTTONS row — this is where address/phone/website/plus_code live
+  // Strategy: look for buttons with data-item-id attributes
+  const actionButtons = document.querySelectorAll('button[data-item-id], a[data-item-id]');
+  actionButtons.forEach(btn => {
+    const itemId = btn.getAttribute('data-item-id') || '';
+    const textEl = btn.querySelector('div.Io6YIf');
+    const text = (textEl ? textEl.innerText : btn.innerText || '').trim();
+    if (itemId === 'address' && !result.address)      result.address = text;
+    if (itemId.startsWith('phone') && !result.phone)  result.phone = text;
+    if (itemId === 'oloc' && !result.plus_code)       result.plus_code = text;
+    if (itemId === 'authority' && !result.website)    result.website = btn.getAttribute('href') || '';
+  });
+
+  // FALLBACK: also check <a> tags without data-item-id for website
+  if (!result.website) {
+    const wsLink = document.querySelector('a[aria-label*="Website" i], a[aria-label*="website" i]');
+    if (wsLink) result.website = wsLink.getAttribute('href') || '';
+  }
+
+  // FALLBACK: phone via tel: link
+  if (!result.phone) {
+    const telLink = document.querySelector('a[href^="tel:"]');
+    if (telLink) result.phone = (telLink.getAttribute('href') || '').replace('tel:', '').trim();
+  }
+
+  // FALLBACK: address via aria-label
+  if (!result.address) {
+    const addrBtn = document.querySelector('button[aria-label^="Address:" i], button[data-item-id="address"]');
+    if (addrBtn) {
+      const al = addrBtn.getAttribute('aria-label') || '';
+      result.address = al.replace(/^Address:\s*/i, '').trim();
+    }
+  }
+
+  // HOURS today — the table row that says "Open/Closed · 9 AM–10 PM"
+  const hoursEl = document.querySelector('div.t39EBfGU tbody tr:first-child td:last-child');
+  if (hoursEl) result.hours_today = hoursEl.innerText.trim();
+  if (!result.hours_today) {
+    const hoursSpan = document.querySelector('span.ZDu9vd, div.t39EBfGU span');
+    if (hoursSpan) result.hours_today = hoursSpan.innerText.trim();
+  }
+
+  // COORDS from page URL
+  const url = location.href;
+  const m = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+  if (m) { result.latitude = m[1]; result.longitude = m[2]; }
+
+  return result;
+}
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -159,104 +357,79 @@ def scroll_feed(page, target_count: int):
 
 
 def extract_feed_cards(page) -> list[dict]:
-    """Fast extraction from feed cards (no detail-page navigation)."""
-    rows = []
-    cards = page.query_selector_all(SEL["card_link"])
-    for card in cards:
-        try:
-            href = card.get_attribute("href") or ""
-            name = (card.get_attribute("aria-label") or "").strip()
-            if not name:
-                inner = card.query_selector(SEL["card_name"])
-                name = inner.inner_text().strip() if inner else ""
-            # parent container often holds rating/category
-            parent = card.evaluate_handle('el => el.closest("div[role=article]") || el.parentElement.parentElement')
-            rating = ""
-            reviews = ""
-            category = ""
-            address = ""
-            try:
-                rt = parent.query_selector(SEL["card_rating"])
-                rating = rt.inner_text().strip() if rt else ""
-            except Exception:
-                pass
-            try:
-                rv = parent.query_selector(SEL["card_reviews"])
-                reviews = parse_reviews_count(rv.inner_text() if rv else "")
-            except Exception:
-                pass
-            try:
-                cat = parent.query_selector(SEL["card_category"])
-                category = cat.inner_text().strip() if cat else ""
-            except Exception:
-                pass
-            try:
-                ad = parent.query_selector(SEL["card_address"])
-                address = ad.inner_text().strip() if ad else ""
-            except Exception:
-                pass
+    """Fast extraction from feed cards via single JS evaluation.
+    No detail-page navigation needed — pulls name/rating/reviews/category/
+    address/coords from the cards themselves."""
+    try:
+        raw = page.evaluate(JS_EXTRACT_FEED_CARDS)
+    except Exception:
+        return []
 
-            lat, lng = parse_coords_from_url(href)
-            rows.append({
-                "name": name,
-                "rating": rating,
-                "reviews": reviews,
-                "category": category,
-                "address": address,
-                "phone": "",
-                "website": "",
-                "plus_code": "",
-                "latitude": lat,
-                "longitude": lng,
-                "hours_today": "",
-                "maps_url": href,
-            })
-        except Exception:
+    rows = []
+    for item in raw or []:
+        if not item.get("name"):
             continue
+        # sanitize text fields
+        for k in ("name", "rating", "reviews", "category", "address"):
+            if isinstance(item.get(k), str):
+                item[k] = re.sub(r"\s+", " ", item[k]).strip()
+        # normalize reviews to plain number string
+        if item.get("reviews"):
+            item["reviews"] = re.sub(r"[^\d.]", "", item["reviews"])
+        rows.append(item)
     return rows
 
 
 def enrich_from_detail(page, row: dict) -> dict:
-    """Visit a detail page and fill in missing fields (phone, website, etc.)."""
+    """Visit a detail page and fill in missing fields via single JS eval.
+    Retries up to 2 times if action buttons haven't rendered yet."""
     try:
         page.goto(row["maps_url"], wait_until="domcontentloaded", timeout=30000)
         try:
             page.wait_for_selector(SEL["name"], timeout=10000)
         except PWTimeout:
             return row
-        time.sleep(random.uniform(0.4, 0.9))
 
-        # Refresh name (more accurate from detail page)
-        dname = text_or_blank(page, SEL["name"])
-        if dname:
-            row["name"] = dname
-        if not row["rating"]:
-            row["rating"] = text_or_blank(page, SEL["rating"])
-        if not row["reviews"]:
-            rv_text = ""
+        # Retry loop: action buttons (address/phone/website) sometimes render
+        # a second or two after the h1. Try up to 3 times.
+        data = None
+        for attempt in range(3):
+            time.sleep(random.uniform(0.5, 1.0))
             try:
-                rv_el = page.query_selector(SEL["reviews"])
-                if rv_el:
-                    rv_text = rv_el.get_attribute("aria-label") or rv_el.inner_text() or ""
+                data = page.evaluate(JS_EXTRACT_DETAIL)
             except Exception:
-                pass
-            row["reviews"] = parse_reviews_count(rv_text)
-        if not row["category"]:
-            row["category"] = text_or_blank(page, SEL["category"])
-        if not row["address"]:
-            row["address"] = text_or_blank(page, SEL["address"])
-        row["phone"] = text_or_blank(page, SEL["phone"])
-        row["website"] = attr_or_blank(page, SEL["website"], "href")
-        if not row["plus_code"]:
-            row["plus_code"] = text_or_blank(page, SEL["plus_code"])
-        if not row["hours_today"]:
-            row["hours_today"] = text_or_blank(page, SEL["hours"])
+                data = None
+            # If we got at least name + (phone OR website OR address), good enough
+            if data and data.get("name") and (
+                data.get("phone") or data.get("website") or data.get("address")
+            ):
+                break
+            # else: small wait and retry (next iteration's sleep handles it)
 
-        # coords from URL (detail page URL often includes them)
-        lat, lng = parse_coords_from_url(page.url)
-        if lat and lng:
-            row["latitude"] = lat
-            row["longitude"] = lng
+        if not data:
+            return row
+
+        # Merge: only overwrite empty fields + always take detail-page phone/website
+        if data.get("name"):
+            row["name"] = data["name"]
+        if data.get("rating") and not row.get("rating"):
+            row["rating"] = data["rating"]
+        if data.get("reviews") and not row.get("reviews"):
+            row["reviews"] = re.sub(r"[^\d.]", "", str(data["reviews"]))
+        if data.get("category") and not row.get("category"):
+            row["category"] = data["category"]
+        if data.get("address") and not row.get("address"):
+            row["address"] = data["address"]
+        # Phone/website/plus_code/hours — always take from detail page
+        row["phone"] = data.get("phone", "")
+        row["website"] = data.get("website", "")
+        if data.get("plus_code"):
+            row["plus_code"] = data["plus_code"]
+        if data.get("hours_today"):
+            row["hours_today"] = data["hours_today"]
+        if data.get("latitude"):
+            row["latitude"] = data["latitude"]
+            row["longitude"] = data["longitude"]
         row["maps_url"] = page.url
     except Exception:
         pass
@@ -531,12 +704,13 @@ def make_json(rows, city_filter=None):
 
 
 def make_xlsx(rows, city_filter=None):
-    """Build an .xlsx file using openpyxl (lazy import)."""
+    """Build an .xlsx file using openpyxl. Returns bytes, or None if openpyxl
+    is unavailable (UI will gracefully hide the button in that case)."""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
-    except ImportError as e:
-        raise RuntimeError("openpyxl not installed. Add it to requirements.txt") from e
+    except ImportError:
+        return None
 
     show = rows if city_filter in (None, "All") else [r for r in rows if r.get("city") == city_filter]
     wb = Workbook()
@@ -829,12 +1003,23 @@ with tab_export:
             "⬇️  Download CSV", data=make_csv(results, export_city),
             file_name=f"{base_name}.csv", mime="text/csv", use_container_width=True,
         )
-        d2.download_button(
-            "⬇️  Download Excel", data=make_xlsx(results, export_city),
-            file_name=f"{base_name}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+
+        xlsx_data = make_xlsx(results, export_city)
+        if xlsx_data is not None:
+            d2.download_button(
+                "⬇️  Download Excel", data=xlsx_data,
+                file_name=f"{base_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            d2.button(
+                "⬇️  Excel unavailable",
+                disabled=True,
+                use_container_width=True,
+                help="openpyxl install failed on this server. CSV/JSON work fine.",
+            )
+
         d3.download_button(
             "⬇️  Download JSON", data=make_json(results, export_city),
             file_name=f"{base_name}.json", mime="application/json", use_container_width=True,
