@@ -21,4 +21,4 @@ libxi6
 libxrender1
 libxss1
 libgtk-3-0
-libgdk-pixbuf2.0-0
+libgdk-pixbuf-2.0-0
