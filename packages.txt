@@ -12,3 +12,9 @@ libgbm1
 libpango-1.0-0
 libcairo2
 libasound2
+libxfixes3
+libxext6
+libx11-6
+libxcb1
+libxcursor1
+libxi6
