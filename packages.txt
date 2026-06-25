@@ -18,3 +18,7 @@ libx11-6
 libxcb1
 libxcursor1
 libxi6
+libxrender1
+libxss1
+libgtk-3-0
+libgdk-pixbuf2.0-0
